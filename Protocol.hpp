@@ -3,10 +3,11 @@
 #include "Util.hpp"
 #include <unistd.h>
 #include <fcntl.h>
+#include <ctype.h>
+#include <sys/wait.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/sendfile.h>
-#include <ctype.h>
 #include <cstdlib>
 #include <iostream>
 #include <sstream>
@@ -18,7 +19,7 @@
 #define HTTP_VERSION "HTTP/1.0"
 
 #define OK 200
-#define WRONG_REQUEST 400
+#define BAD_REQUEST 400
 #define NOT_FOUND 404
 #define SERVER_ERROR 500
 
@@ -51,7 +52,7 @@ public:
     
     //由请求报头解析得到
     std::unordered_map<std::string, std::string> headerMap_; //建立报头的键值关系
-    int contentLen_; //数据部分长度，目的是确定正文部分数据大小
+    int contentLen_; //数据部分长度，目的是确定正文部分数据大小，实际上是reqBody_.size()
     std::string suffix_; //请求资源的后缀
 
     bool cgi_; //判断是否设置CGI机制
@@ -155,7 +156,6 @@ private:
             key.resize(key.size()-1);
             httpReq_.headerMap_.insert(make_pair(key, value));
             // for test
-            // std::cout << "########################\n";
             // LOG(INFO, key);
             // LOG(INFO, value);
         }
@@ -206,7 +206,130 @@ private:
     //CGI
     int ProcessCgi()
     {
+        LOG(INFO, "CGI is beginning");
 
+        int code = OK;
+        auto& method = httpReq_.method_;
+        auto& argu = httpReq_.argu_;         //GET数据
+        auto& body_data = httpReq_.reqBody_; //POST数据
+        auto& content_len = httpReq_.contentLen_;
+        auto& bin = httpReq_.path_; //bin指需要运行的CGI程序，就是path_中存储的路径对应文件
+        auto& res_body = httpRes_.resBody_;
+
+        std::string method_env; //请求方法
+        std::string query_env; //表示GET方法请求数据
+        std::string content_len_env; //表示POST方法正文长度
+
+        //创建两个匿名管道，站在父进程角度
+        int input[2];
+        int output[2];
+
+        if(pipe(input) < 0){
+            LOG(ERROR, "input pipe error");
+            code = SERVER_ERROR;
+            return code;
+        }
+        if(pipe(output) < 0){
+            LOG(ERROR, "output pipe error");
+            code = SERVER_ERROR;
+            return code;
+        }
+
+        //当前新线程创建子进程
+        pid_t pid = fork();
+        if(pid == 0){
+            //child:
+            //关闭管道对应文件描述符
+            close(input[0]);
+            close(output[1]);
+
+            //设置mothod作为环境变量
+            method_env += "METHOD=";
+            method_env += method;
+            putenv((char*)method_env.c_str());
+
+            //判断是GET方法还是POST方法，分别进行环境变量设置
+            if(method == "GET"){
+                query_env += "QUERY_STRING=";
+                query_env += argu;
+                putenv((char*)query_env.c_str());
+                LOG(INFO, "GET method, add QUERY_STRING env");
+            }
+            else if(method == "POST"){
+                content_len_env += "CONTENT_LENGTH=";
+                content_len_env += std::to_string(content_len);
+                putenv((char*)content_len_env.c_str());
+                LOG(INFO, "POST method, add CONTENT_LENGTH env");
+            }
+            else{}  
+
+            LOG(INFO, std::string("bin: ")+bin);
+
+            //子进程进行重定向
+            //注意重定向一定要放到整个代码后面，不然前面的日志信息都没法输出了
+            dup2(output[0], 0);
+            dup2(input[1], 1);
+
+            //继续程序替换，运行的程序就是bin
+            execl(bin.c_str(), bin.c_str(), nullptr);
+        }
+        else if(pid > 0){
+            //father:
+            //关闭对应文件描述符
+            close(input[1]);
+            close(output[0]);
+
+            //如果是POST方法，父进程还需要将正文数据通过管道传过去
+            //如果POST正文数据太大，一次write不一定能发送完，因此需要考虑多次发送
+            if(method == "POST"){
+                const char* start = body_data.c_str(); //需要发送数据的开始
+                size_t total = 0; //已经发送的数据总数，需要和content_len比较
+                size_t size = 0; //send函数返回值
+                //while循环条件：total<content_len为还需要继续发送，size>0为发送成功
+                while(total < content_len && (size = write(output[1], start+total, body_data.size()-total)) > 0){
+                    total += size;
+                }
+            }
+
+            //从子进程读取内容，一个字节为单位读取
+            char ch = 0;
+            while(read(input[0], &ch, 1) > 0){
+                res_body += ch;
+            }
+
+            //等待子进程
+            int status = 0;
+            pid_t ret = waitpid(pid, &status, 0);
+            if(ret == pid){
+                //WIFEXITED(status)非0，表示子进程正常退出
+                if(WIFEXITED(status)){
+                    //如果子进程正常退出，就可以使用WEXITSTATUS获取子进程的退出码
+                    //例如子进程exit(0);退出，则WEXITSTATUS(status)就是0
+                    if(WEXITSTATUS(status) == 0){
+                        code = OK;
+                    }
+                    else{
+                        code = BAD_REQUEST;
+                    }
+                }
+                else{
+                    code = SERVER_ERROR;
+                }
+            }
+            LOG(INFO, "CIG process quit");
+
+            //关闭文件描述符
+            close(input[0]);
+            close(output[1]);
+            //子进程不用关闭，因为子进程退出资源自然销毁
+            //并且子进程推出后read也会自动停止，保证上面的read不会阻塞
+        }
+        else{
+            LOG(ERROR, "fork error");
+            code = SERVER_ERROR;
+            return code;
+        }
+        return code;
     }
 
     //非CGI
@@ -237,17 +360,38 @@ private:
         //注意，设置CGI机制时才会用到body，这时才有body的大小；不用时没有body，就是资源文件大小
         if(httpReq_.cgi_){
             line += std::to_string(body.size());
+            LOG(INFO, std::string("Content length: ")+std::to_string(body.size()));
         }
         else{
             line += std::to_string(httpReq_.size_);
+            LOG(INFO, std::string("Content length: ")+std::to_string(httpReq_.size_));
         }
         line += LINE_END;
         header.push_back(line);
+        LOG(INFO, "BuildOkResponse is successful");
     }
 
-    void HandlerError(std::string& path)
+    void HandlerError(std::string page)
     {
+        // std::cout << "debug: " << page << std::endl;
+        LOG(INFO, std::string("handler error, path: ")+page);
+        httpReq_.cgi_ = false;
+        //要给用户返回对应的404页面
+        httpRes_.fd_ = open(page.c_str(), O_RDONLY);
+        if(httpRes_.fd_ > 0){
+            struct stat st;
+            stat(page.c_str(), &st);
+            httpReq_.size_ = st.st_size;
 
+            std::string line = "Content-Type: text/html";
+            line += LINE_END;
+            httpRes_.resHeader_.push_back(line);
+
+            line = "Content-Length: ";
+            line += std::to_string(st.st_size);
+            line += LINE_END;
+            httpRes_.resHeader_.push_back(line);
+        }
     }
 
     //封装为一个报文
@@ -255,6 +399,7 @@ private:
     {
         auto& sline = httpRes_.statusLine_;
         auto& code = httpRes_.statusCode_;
+
 
         //构建状态行
         sline += HTTP_VERSION;
@@ -264,11 +409,13 @@ private:
         sline += Util::Code2Desc(code);
         sline += LINE_END;
 
+        LOG(INFO, std::string("code: ")+std::to_string(code));
+
         //构建响应报头
         std::string path = WEB_ROOT;
         path += "/";
         switch(code){
-        //为了简单起见，将NOT_FOUND WRONG_REQUEST SERVER_ERROR都作为404处理
+        //为了简单起见，将NOT_FOUND BAD_REQUEST SERVER_ERROR都作为404处理
             case OK:
                 BuildOkResponse();
                 break;
@@ -276,7 +423,7 @@ private:
                 path += PAGE_404;
                 HandlerError(path);
                 break;
-            case WRONG_REQUEST:
+            case BAD_REQUEST:
                 path += PAGE_404;
                 HandlerError(path);
                 break;
@@ -287,7 +434,6 @@ private:
             default:
                 break;
         }
-
     }
 
 public:
@@ -333,12 +479,13 @@ public:
             //如果method等于其他方法，认为非法
             LOG(WARNING, "Wrong method");
             std::cout << "method is " << method << std::endl;
-            code = WRONG_REQUEST;
+            code = BAD_REQUEST;
         }
         else{
             //如果method为正确方法，进入正确逻辑
             if(method == "GET"){
-                //判断uri是否有参数，如果由设置CGI机制
+                //判断uri是否有参数，如果有设置CGI机制
+                LOG(INFO, "GET method");
                 auto it = uri.find("?");
                 if(it != std::string::npos){
                     //说明uri有参数，设置启用CGI机制
@@ -348,6 +495,8 @@ public:
                     Util::CutString(uri, v, "?");
                     path = v[0];
                     argu = v[1];
+                    LOG(INFO, "GET CGI enabled");
+                    LOG(INFO, std::string("argu: ")+argu);
                 }
                 else{
                     //说明uri无参数，不启用CGI机制，并且确定path就是uri
@@ -358,12 +507,14 @@ public:
                 //确定使用CGI机制，并且path就是uri
                 httpReq_.cgi_ = true;
                 path = uri;
+                LOG(INFO, "POST method");
             }
 
             //获取真实路径并判断处理
             std::string vPath = path;
             path = WEB_ROOT;
             path += vPath;
+            LOG(INFO, std::string("path: ")+path);
 
             //对请求资源的判断和处理
             //如果对方发来的只是一个根目录
@@ -373,7 +524,6 @@ public:
             }
             struct stat st; //stat结构体和函数同名，因此必须加struct
             //判断请求资源是否存在
-            std::cout << "#############文件：" << path << std::endl;
             if(stat(path.c_str(), &st) != 0){
                 //资源不存在
                 code = NOT_FOUND;
@@ -384,23 +534,26 @@ public:
                 //判断资源是否是目录
                 if(S_ISDIR(st.st_mode)){
                     //如果是目录，返回首页，但是肯定不以/结尾，因为此情况上面处理过了
-                    std::cout << "################目录\n";
                     path += "/";
                     path += HOME_PAGE;
-                    std::cout << "################文件: " << path << std::endl;
+                    //很易错，这里path改变了，必须要再stat一次，获取新的st
+                    stat(path.c_str(), &st);
+                    LOG(WARNING, "access directory");
                 }
-                //如果不是目录，但有可执行权限
-                if( (st.st_mode&S_IXUSR) || (st.st_mode&S_IXGRP) || (st.st_mode&S_IXOTH) ){
-                    //设置CGI
-                    httpReq_.cgi_ = true;
+                else{
+                    //如果不是目录，但有可执行权限
+                    if( (st.st_mode&S_IXUSR) || (st.st_mode&S_IXGRP) || (st.st_mode&S_IXOTH) ){
+                        //设置CGI
+                        httpReq_.cgi_ = true;
+                    }   
+                    //其他文件，不需要在此处设置CGI
+                    //最后获取该资源得大小
                 }
-                //其他文件，不需要在此处设置CGI
-                //最后获取该资源得大小
                 httpReq_.size_ = st.st_size;
 
                 //进行资源后缀判断
                 int found = path.rfind(".");
-                if(found != std::string::npos){
+                if(found == std::string::npos){
                     //如果没找到，说明path是目录，资源为HOME_PAGE
                     suffix = ".html";
                 }
@@ -418,10 +571,10 @@ public:
                     code = ProcessNonCgi(); //简单的网页返回，返回静态网页,只需要打开即可
                 }
 
-                //封装响应报头
-                BuildHttpResHelper();
             }
         }
+        //封装响应报头
+        BuildHttpResHelper();
     }
 
     //发送响应报文
@@ -430,12 +583,16 @@ public:
         //发送响应状态行
         auto& sline = httpRes_.statusLine_;
         send(sock_, sline.c_str(), sline.size(), 0);
+        std::string sline_tem = sline;
+        sline_tem.pop_back(); //防止打印的时候还有\n
+        //LOG(INFO, std::string("Send status line: ")+sline_tem);
 
         //发送响应报头
         auto& header = httpRes_.resHeader_;
         for(auto e : header){
             send(sock_, e.c_str(), e.size(), 0);
         }
+        LOG(INFO, "Send header");
 
         //发送空行
         auto& blank = httpRes_.blank_;
@@ -444,6 +601,22 @@ public:
         //发送正文
         if(httpReq_.cgi_){
             //发送body
+            auto& body = httpRes_.resBody_;
+            const char* start = body.c_str();
+            size_t total = 0;
+            size_t size = 0;
+
+            while(total < body.size() && (size = send(sock_, start+total, body.size()-total, 0)) > 0){
+                total += size;
+            }
+
+            //for test:
+            // int fd = open("a.txt", O_WRONLY);
+            // while(total < body.size() && (size = write(sock_, start+total, body.size()-total)) > 0){
+            //     total += size;
+            // }
+            // std::cout << body << std::endl;
+            // close(fd);
         }
         else{
             //直接通过sendfile文件，把资源文件发送到socket里，不需要上层的缓冲区
@@ -454,22 +627,33 @@ public:
     }
 };
 
-
-
-class Entry
+class Callback
 {
 public:
-    static void* Handler(void* temp_sock)
+    Callback(){}
+
+    //设置一个仿函数，实现回调机制，这样一个Task就可以调用Handler处理请求
+    void operator()(int sock)
     {
-        int sock = *((int*)temp_sock);
-        delete (int*)temp_sock;
+        Handler(sock);
+    }
+
+    void Handler(int sock)
+    {
+        LOG(INFO, "handler is beginning");
 
         EndPoint* pe  = new EndPoint(sock);
         pe->RecvHttpRequest();
-        pe->BuildHttpResponse();
-        pe->SendHttpResponse();
+        if(!pe->IsStop()){
+            LOG(INFO, "No receive error, begin to build and send a response");
+            pe->BuildHttpResponse();
+            pe->SendHttpResponse();
+        }
+        else{
+            LOG(WRONG, "Receive error");
+        }
 
+        delete pe;
         close(sock);
-        return nullptr;
     }
 };
