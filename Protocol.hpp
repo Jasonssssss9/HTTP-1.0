@@ -28,6 +28,8 @@
 #define HTTP_VERSION "HTTP/1.0" //默认HTTP版本
 #define LINE_END "\r\n"         //默认换行符
 #define PAGE_404 "404.html"     //默认404页面
+#define PAGE_400 "400.html"     //默认400页面
+#define PAGE_500 "500.html"     //默认500页面
 
 
 //Http请求结构体
@@ -77,7 +79,7 @@ public:
     int statusCode_; //状态码
     int fd_;         //打开资源文件的文件描述符
 
-    HttpResponse():statusCode_(0), fd_(-1){}
+    HttpResponse():blank_(LINE_END), statusCode_(0), fd_(-1){}
 };
 
 //EndPoint类为HTTP服务器的核心，用来读取请求，分析请求，并构建响应
@@ -376,7 +378,7 @@ private:
         // std::cout << "debug: " << page << std::endl;
         LOG(INFO, std::string("handler error, path: ")+page);
         httpReq_.cgi_ = false;
-        //要给用户返回对应的404页面
+        //要给用户返回对应的404、400、500页面
         httpRes_.fd_ = open(page.c_str(), O_RDONLY);
         if(httpRes_.fd_ > 0){
             struct stat st;
@@ -424,11 +426,11 @@ private:
                 HandlerError(path);
                 break;
             case BAD_REQUEST:
-                path += PAGE_404;
+                path += PAGE_400;
                 HandlerError(path);
                 break;
             case SERVER_ERROR:
-                path += PAGE_404;
+                path += PAGE_500;
                 HandlerError(path);
                 break;
             default:
@@ -592,7 +594,7 @@ public:
         for(auto e : header){
             send(sock_, e.c_str(), e.size(), 0);
         }
-        LOG(INFO, "Send header");
+        //LOG(INFO, "Send header");
 
         //发送空行
         auto& blank = httpRes_.blank_;
@@ -610,13 +612,8 @@ public:
                 total += size;
             }
 
-            //for test:
-            // int fd = open("a.txt", O_WRONLY);
-            // while(total < body.size() && (size = write(sock_, start+total, body.size()-total)) > 0){
-            //     total += size;
-            // }
-            // std::cout << body << std::endl;
-            // close(fd);
+            LOG(INFO, "send data successfully");
+
         }
         else{
             //直接通过sendfile文件，把资源文件发送到socket里，不需要上层的缓冲区
