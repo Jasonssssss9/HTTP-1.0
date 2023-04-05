@@ -605,8 +605,8 @@ public:
             //发送body
             auto& body = httpRes_.resBody_;
             const char* start = body.c_str();
-            size_t total = 0;
-            size_t size = 0;
+            ssize_t total = 0;
+            ssize_t size = 0;
 
             while(total < body.size() && (size = send(sock_, start+total, body.size()-total, 0)) > 0){
                 total += size;

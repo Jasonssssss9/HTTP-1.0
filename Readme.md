@@ -57,8 +57,6 @@
 
   ![16](./image/16.jpg)
 
-
-
 * POST方法
 
   ![17](.\image\17.jpg)

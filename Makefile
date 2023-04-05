@@ -1,7 +1,7 @@
 bin=server
 cgi=test_cgi
 cc=g++
-LD_FLAGS=-std=c++11 -lpthread
+LD_FLAGS=-std=c++17 -lpthread
 curr=$(shell pwd)
 src=server.cpp single.cpp
 
